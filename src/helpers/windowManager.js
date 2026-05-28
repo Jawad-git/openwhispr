@@ -274,6 +274,7 @@ class WindowManager {
 
     if (this.textEditMonitor) this.textEditMonitor.captureTargetPid();
     this.showDictationPanel();
+    this.restoreTargetAppFocus().catch(() => {});
 
     const safetyTimeoutId = setTimeout(() => {
       if (this.macCompoundPushState?.active) {
@@ -397,7 +398,11 @@ class WindowManager {
     const MIN_HOLD_DURATION_MS = 150;
     const downTime = Date.now();
 
+    // Capture the foreground window before our panel steals focus.
+    this.captureTargetFocus();
     this.showDictationPanel();
+    // Restore focus to the original app immediately.
+    this.restoreTargetAppFocus().catch(() => {});
 
     this.winPushState = {
       active: true,
@@ -445,7 +450,11 @@ class WindowManager {
       return;
     }
     if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+      // Capture the foreground app before our panel appears.
+      this.captureTargetFocus();
       this.showDictationPanel();
+      // Restore focus to the original app so the user can keep typing.
+      this.restoreTargetAppFocus().catch(() => {});
       this.mainWindow.webContents.send("toggle-dictation");
       this._isDictatingToggle = !this._isDictatingToggle;
       this.meetingDetectionEngine?.setUserRecording(this._isDictatingToggle);
@@ -1004,6 +1013,115 @@ class WindowManager {
       this._panelStartPosition
     );
     this.mainWindow.setBounds(newPos);
+  }
+
+  /**
+   * Resolve the path to the windows-fast-paste.exe binary.
+   * Returns the path string, or null if not found.
+   * Caches the result for the lifetime of the process.
+   */
+  _resolveWindowsFastPasteBinary() {
+    if (this._winFastPasteChecked) return this._winFastPastePath;
+    this._winFastPasteChecked = true;
+    if (process.platform !== "win32") return null;
+
+    const path = require("path");
+    const fs = require("fs");
+
+    const candidates = new Set([
+      path.join(__dirname, "..", "..", "resources", "bin", "windows-fast-paste.exe"),
+      path.join(__dirname, "..", "..", "resources", "windows-fast-paste.exe"),
+    ]);
+    if (process.resourcesPath) {
+      [
+        path.join(process.resourcesPath, "windows-fast-paste.exe"),
+        path.join(process.resourcesPath, "bin", "windows-fast-paste.exe"),
+        path.join(process.resourcesPath, "resources", "windows-fast-paste.exe"),
+        path.join(process.resourcesPath, "resources", "bin", "windows-fast-paste.exe"),
+        path.join(process.resourcesPath, "app.asar.unpacked", "resources", "windows-fast-paste.exe"),
+        path.join(process.resourcesPath, "app.asar.unpacked", "resources", "bin", "windows-fast-paste.exe"),
+      ].forEach((c) => candidates.add(c));
+    }
+    for (const c of candidates) {
+      try {
+        if (fs.statSync(c).isFile()) {
+          this._winFastPastePath = c;
+          return c;
+        }
+      } catch {}
+    }
+    return null;
+  }
+
+  /**
+   * Capture the currently focused window so we can restore it later.
+   * On macOS: uses NSWorkspace via osascript (existing textEditMonitor).
+   * On Windows: uses the windows-fast-paste.exe binary with --capture-foreground.
+   * On other platforms: no-op.
+   */
+  captureTargetFocus() {
+    if (process.platform === "darwin") {
+      if (this.textEditMonitor) this.textEditMonitor.captureTargetPid();
+      return;
+    }
+    if (process.platform === "win32") {
+      const binary = this._resolveWindowsFastPasteBinary();
+      if (!binary) return;
+      const { spawn } = require("child_process");
+      const proc = spawn(binary, ["--capture-foreground"], {
+        stdio: ["ignore", "pipe", "pipe"],
+        windowsHide: true,
+      });
+      proc.on("error", (err) => {
+        debugLogger.warn("[FocusCapture] Failed to capture foreground window", { error: err.message });
+      });
+    }
+  }
+
+  /**
+   * Restore focus to the app that was focused before the dictation panel appeared.
+   * On macOS: activates the captured PID via NSRunningApplication.
+   * On Windows: calls SetForegroundWindow via windows-fast-paste.exe --restore-foreground.
+   * On Linux: blur() fallback.
+   */
+  async restoreTargetAppFocus() {
+    // macOS: use the captured target PID
+    if (process.platform === "darwin" && this.textEditMonitor) {
+      const pid = this.textEditMonitor.lastTargetPid;
+      if (pid) {
+        await this.textEditMonitor.activateTargetPid();
+        return;
+      }
+    }
+
+    // Windows: use the native binary to restore the captured HWND
+    if (process.platform === "win32") {
+      const binary = this._resolveWindowsFastPasteBinary();
+      if (binary) {
+        const { spawn } = require("child_process");
+        return new Promise((resolve) => {
+          const proc = spawn(binary, ["--restore-foreground"], {
+            stdio: ["ignore", "pipe", "pipe"],
+            windowsHide: true,
+          });
+          let stderr = "";
+          proc.stderr?.on("data", (d) => { stderr += d.toString(); });
+          proc.on("close", (code) => {
+            if (code !== 0) {
+              debugLogger.debug("[FocusRestore] Windows restore failed", { code, stderr: stderr.trim() });
+            }
+            resolve();
+          });
+          proc.on("error", () => resolve());
+        });
+      }
+    }
+
+    // Linux fallback: blur our window
+    if (this.mainWindow && !this.mainWindow.isDestroyed() && this.mainWindow.isFocused()) {
+      this.mainWindow.blur();
+      await new Promise((resolve) => setTimeout(resolve, 80));
+    }
   }
 
   showDictationPanel(options = {}) {
