@@ -18,6 +18,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 
 static const char* TERMINAL_CLASSES[] = {
     "ConsoleWindowClass",
@@ -159,13 +160,106 @@ static int SendPasteTerminal(void) {
     return (sent == 6) ? 0 : 1;
 }
 
+/* Path to the file where we persist the foreground HWND between invocations.
+   Written by --capture-foreground, read by --restore-foreground. */
+static const char* FOCUS_STATE_FILE = "openwhispr-focus-state.txt";
+
+static int CaptureForeground(void) {
+    HWND hwnd = GetForegroundWindow();
+    if (!hwnd) {
+        fprintf(stderr, "ERROR: No foreground window found\n");
+        return 2;
+    }
+
+    /* Write the HWND value as a decimal string to the state file. */
+    char tmpPath[MAX_PATH];
+    DWORD len = GetTempPathA(MAX_PATH, tmpPath);
+    if (len == 0 || len >= MAX_PATH) {
+        fprintf(stderr, "ERROR: GetTempPath failed\n");
+        return 1;
+    }
+    strcat(tmpPath, FOCUS_STATE_FILE);
+
+    FILE* f = fopen(tmpPath, "w");
+    if (!f) {
+        fprintf(stderr, "ERROR: Cannot write focus state file\n");
+        return 1;
+    }
+    fprintf(f, "%lld", (long long)(intptr_t)hwnd);
+    fclose(f);
+
+    printf("CAPTURED %lld\n", (long long)(intptr_t)hwnd);
+    fflush(stdout);
+    return 0;
+}
+
+static int RestoreForeground(void) {
+    char tmpPath[MAX_PATH];
+    DWORD len = GetTempPathA(MAX_PATH, tmpPath);
+    if (len == 0 || len >= MAX_PATH) {
+        fprintf(stderr, "ERROR: GetTempPath failed\n");
+        return 1;
+    }
+    strcat(tmpPath, FOCUS_STATE_FILE);
+
+    FILE* f = fopen(tmpPath, "r");
+    if (!f) {
+        fprintf(stderr, "ERROR: No focus state file found\n");
+        return 1;
+    }
+
+    long long hwndVal = 0;
+    if (fscanf(f, "%lld", &hwndVal) != 1 || hwndVal == 0) {
+        fclose(f);
+        fprintf(stderr, "ERROR: Cannot read HWND from state file\n");
+        return 1;
+    }
+    fclose(f);
+
+    HWND hwnd = (HWND)(intptr_t)hwndVal;
+
+    /* Verify the window still exists before trying to restore. */
+    if (!IsWindow(hwnd)) {
+        fprintf(stderr, "WARN: Captured window no longer exists\n");
+        return 1;
+    }
+
+    /* Bring the window to the foreground.  This may fail if the calling
+       process is not the foreground process, but on Windows it typically
+       works because our process was the last to receive input via the
+       native key hook. */
+    if (!SetForegroundWindow(hwnd)) {
+        /* Fallback: try BringWindowToTop + SetFocus */
+        BringWindowToTop(hwnd);
+        fprintf(stderr, "WARN: SetForegroundWindow failed, tried BringWindowToTop\n");
+        return 1;
+    }
+
+    printf("RESTORED %lld\n", hwndVal);
+    fflush(stdout);
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
     BOOL detectOnly = FALSE;
+    BOOL captureFg = FALSE;
+    BOOL restoreFg = FALSE;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--detect-only") == 0) {
             detectOnly = TRUE;
+        } else if (strcmp(argv[i], "--capture-foreground") == 0) {
+            captureFg = TRUE;
+        } else if (strcmp(argv[i], "--restore-foreground") == 0) {
+            restoreFg = TRUE;
         }
+    }
+
+    if (captureFg) {
+        return CaptureForeground();
+    }
+    if (restoreFg) {
+        return RestoreForeground();
     }
 
     HWND hwnd = GetForegroundWindow();
