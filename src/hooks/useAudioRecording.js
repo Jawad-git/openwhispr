@@ -94,6 +94,11 @@ export const useAudioRecording = (toast, options = {}) => {
         if (!isStreaming) {
           setPartialTranscript("");
         }
+        // When processing starts, proactively restore focus to the original
+        // app so the user can keep interacting while transcription runs.
+        if (isProcessing) {
+          window.electronAPI?.restoreTargetFocus?.();
+        }
       },
       onError: (error) => {
         if (error?.title !== "Paste Error") {
